@@ -15,7 +15,7 @@
 """Sharding utilities."""
 
 from collections.abc import Sequence
-from typing import Tuple
+from typing import Any, Tuple
 
 import jax
 from jax import numpy as jnp
@@ -50,10 +50,11 @@ def place_array_on_target(
           f'(current sharding={arr.sharding}, target={target}).'
       )
   if isinstance(target, shd.Sharding) and not target.is_fully_addressable:
-    host_arr = np.asarray(jax.device_get(arr))
-    return jax.make_array_from_callback(
-        host_arr.shape, target, lambda idx: host_arr[idx]
-    )
+    with jax.transfer_guard('allow'):
+      host_arr = np.asarray(jax.device_get(arr))
+      return jax.make_array_from_callback(
+          host_arr.shape, target, lambda idx: host_arr[idx]
+      )
   with jax.transfer_guard('allow'):
     return jax.device_put(arr, target)
 
@@ -94,6 +95,31 @@ def place_arrays_on_targets(
     ]
   with jax.transfer_guard('allow'):
     return list(jax.device_put(list(arrays), list(targets)))
+
+
+def place_array_leaf(
+    leaf: Any,
+    target: shd.Sharding | jax.Device,
+) -> Any:
+  """Places an array leaf onto `target`, leaving non-array values intact.
+
+  A `jax.tree.map`-friendly wrapper around `place_array_on_target` for
+  batches that mix arrays with Python values.
+
+  Args:
+    leaf: Tree leaf (array or arbitrary Python value).
+    target: Target sharding or device.
+
+  Returns:
+    The placed `jax.Array`, or `leaf` unchanged when it is not an array.
+
+  Raises:
+    ValueError: If `leaf` is a non-fully-addressable `jax.Array` whose sharding
+      does not match `target`.
+  """
+  if not isinstance(leaf, (jax.Array, np.ndarray)):
+    return leaf
+  return place_array_on_target(leaf, target)
 
 
 def spec_on_mesh(

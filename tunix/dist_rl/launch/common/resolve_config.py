@@ -565,6 +565,51 @@ def _validate_k8s_worker_jobsets(hp: cli_config.HyperParameters) -> None:
     )
 
 
+def _validate_replica_count(cluster: Mapping[str, Any], role: str) -> int:
+  """Validates `cluster_config.<role>_replicas` and returns it as an int."""
+  key = f"{role}_replicas"
+  replicas = cluster[key]
+  if (
+      isinstance(replicas, bool)
+      or not isinstance(replicas, int)
+      or replicas < 1
+  ):
+    raise ValueError(
+        f"cluster_config.{key} must be an int >= 1, got {replicas!r}."
+    )
+  if cluster["target"] == "local" and replicas != 1:
+    raise ValueError(
+        f"cluster_config.target=local runs one {role} (local.sh starts one), so"
+        f" cluster_config.{key} must be 1, got {replicas}."
+    )
+  return replicas
+
+
+def _validate_trainer_replicas(hp: cli_config.HyperParameters) -> None:
+  """Checks `cluster_config.trainer_replicas`.
+
+  Only the shared-slice `ici_slice_worker` launcher starts more than one
+  trainer; `k8s.sh` and `local.sh` deploy one.
+
+  Args:
+    hp: Loaded configuration.
+
+  Raises:
+    ValueError: If `trainer_replicas` is not an int >= 1, is not 1 on
+      `target: local`, or is above 1 without `weight_sync_config.mode=ici`.
+  """
+  replicas = _validate_replica_count(
+      hp.config_mapping("cluster_config"), "trainer"
+  )
+  mode = hp.config_mapping("weight_sync_config")["mode"]
+  if replicas > 1 and mode != common_datatypes.WeightSyncMode.ICI.value:
+    raise ValueError(
+        f"cluster_config.trainer_replicas={replicas} requires"
+        " weight_sync_config.mode=ici (launched by ici_slice_worker), got"
+        f" mode={mode!r}."
+    )
+
+
 def _validate_rollout_replicas(hp: cli_config.HyperParameters) -> None:
   """Checks `cluster_config.{rollout_replicas,min_rollout_replicas}`.
 
@@ -577,21 +622,7 @@ def _validate_rollout_replicas(hp: cli_config.HyperParameters) -> None:
       null nor an int in `1..rollout_replicas`.
   """
   cluster = hp.config_mapping("cluster_config")
-  replicas = cluster["rollout_replicas"]
-  if (
-      isinstance(replicas, bool)
-      or not isinstance(replicas, int)
-      or replicas < 1
-  ):
-    raise ValueError(
-        "cluster_config.rollout_replicas must be an int >= 1, got"
-        f" {replicas!r}."
-    )
-  if cluster["target"] == "local" and replicas != 1:
-    raise ValueError(
-        "cluster_config.target=local runs one rollout (local.sh starts one), so"
-        f" cluster_config.rollout_replicas must be 1, got {replicas}."
-    )
+  replicas = _validate_replica_count(cluster, "rollout")
   min_replicas = cluster["min_rollout_replicas"]
   if min_replicas is None:
     return
@@ -763,6 +794,7 @@ _FORBIDDEN_ROLE_ENVS: Final[Mapping[str, str]] = types.MappingProxyType({
         "set cluster_config.k8s.enable_pathways_persistence instead"
     ),
     "DIST_RL_WORKER_PORT": "launcher-managed worker identity",
+    "DIST_RL_TRAINER_REPLICA": "launcher-managed worker identity",
     "DIST_RL_ROLLOUT_REPLICA": "launcher-managed worker identity",
 })
 _ROLE_ENV_PREFIX_REASONS: Final[tuple[tuple[str, str], ...]] = (
@@ -880,6 +912,7 @@ def _validate_dist_invariants(hp: cli_config.HyperParameters) -> None:
   _validate_k8s_jax_cache_gcs(hp)
   _validate_k8s_scalars(hp)
   _validate_k8s_worker_jobsets(hp)
+  _validate_trainer_replicas(hp)
   _validate_rollout_replicas(hp)
   _validate_role_env(hp)
   _validate_trajectory_logging(hp)

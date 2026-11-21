@@ -53,6 +53,9 @@ ProcessRole = resolve_config.ProcessRole
 # (0-based) when `cluster_config.rollout_replicas > 1`, instead of giving each
 # replica its own config.
 ROLLOUT_REPLICA_ENV = "DIST_RL_ROLLOUT_REPLICA"
+# Environment variable holding each trainer process's 0-based index when
+# `cluster_config.trainer_replicas > 1` (multi-host McJAX trainer).
+TRAINER_REPLICA_ENV = "DIST_RL_TRAINER_REPLICA"
 # Environment variable holding the worker's gRPC port on
 # `cluster_config.target: external`, where the launcher assigns each process
 # its own port (e.g. one a job scheduler allocates), instead of giving each
@@ -71,6 +74,7 @@ CONFIG_SHA256_METADATA_KEY = "config_sha256"
 # nodes set; the prefixes are whole namespaces.
 _LOGGED_ENV_VARS = frozenset({
     ROLLOUT_REPLICA_ENV,
+    TRAINER_REPLICA_ENV,
     WORKER_PORT_ENV,
     "ALLOW_MULTIPLE_LIBTPU_LOAD",
     "DISABLE_JAX_CACHE",
@@ -350,6 +354,74 @@ def require_discovery_context(
   )
 
 
+_REPLICA_ROLE_SPECS: Final[dict[str, tuple[str, str]]] = {
+    "trainer": ("trainer_replicas", TRAINER_REPLICA_ENV),
+    "rollout": ("rollout_replicas", ROLLOUT_REPLICA_ENV),
+}
+
+
+def resolve_replica_index(
+    role: str,
+    replicas: int,
+    env_var: str,
+) -> int | None:
+  """Parses and validates a 0-based worker replica index from `env_var`.
+
+  Args:
+    role: Role name (`"trainer"` or `"rollout"`) for error messages.
+    replicas: Configured replica count (`cluster_config.<role>_replicas`).
+    env_var: Environment variable name holding the 0-based replica index.
+
+  Returns:
+    The validated 0-based integer replica index, or None when `replicas == 1`
+    and `env_var` is unset.
+
+  Raises:
+    ValueError: If `env_var` is required and missing, not a non-negative
+      integer, or outside `[0, replicas)`.
+  """
+  raw_replica = os.environ.get(env_var)
+  if raw_replica is None:
+    if replicas == 1:
+      return None
+    raise ValueError(
+        f"{env_var} must be set on each {role} replica when"
+        f" cluster_config.{role}_replicas={replicas}."
+    )
+  if not raw_replica.isdecimal():
+    raise ValueError(
+        f"{env_var} must be a non-negative integer, got {raw_replica!r}."
+    )
+  replica = int(raw_replica)
+  if not 0 <= replica < replicas:
+    raise ValueError(
+        f"{env_var}={replica} is out of range for"
+        f" cluster_config.{role}_replicas={replicas}."
+    )
+  return replica
+
+
+def base_worker_id(
+    hp: resolve_config.DistHyperParameters,
+    role: NodeRole,
+    local_worker_id: str,
+) -> str:
+  """Returns the worker id of `role` before any per-replica suffix.
+
+  Args:
+    hp: Validated distributed RL configuration.
+    role: Node role, which selects the `cluster_config.k8s.<role>_id` key.
+    local_worker_id: Worker id used on `target: local` and `target: external`.
+
+  Returns:
+    `cluster_config.k8s.<role>_id` on `target: k8s`, else `local_worker_id`.
+  """
+  cluster = hp.config_mapping("cluster_config")
+  if cluster["target"] == "k8s":
+    return str(cluster["k8s"][f"{role}_id"])
+  return local_worker_id
+
+
 def worker_id(
     hp: resolve_config.DistHyperParameters,
     role: NodeRole,
@@ -362,11 +434,11 @@ def worker_id(
   launcher's value). On `target: local` and `target: external` it is the fixed
   `local_worker_id`, which keeps the ids stable across users.
 
-  With several rollout replicas (`cluster_config.rollout_replicas > 1`, which
-  `target: local` rejects), each rollout replica takes its index from
-  `ROLLOUT_REPLICA_ENV`, so the replicas share one config: on k8s it appends
-  `-<index>` to its id, matching its JobSet name; on external its id is
-  `rollout-<index>`.
+  With several trainer or rollout replicas (`cluster_config.trainer_replicas >
+  1` or `rollout_replicas > 1`, which `target: local` rejects), each replica
+  takes its index from `TRAINER_REPLICA_ENV` / `ROLLOUT_REPLICA_ENV` so the
+  replicas share one config: on k8s it appends `-<index>` to its id; on
+  external its id is `<role>-<index>`.
 
   Args:
     hp: Validated distributed RL configuration.
@@ -377,41 +449,21 @@ def worker_id(
     The worker id.
 
   Raises:
-    ValueError: If `ROLLOUT_REPLICA_ENV` is unset (when `rollout_replicas > 1`),
-      not a non-negative integer, or out of `[0, rollout_replicas)` on a rollout
-      worker.
+    ValueError: If the replica env var is unset (when replicas > 1), not a
+      non-negative integer, or out of `[0, replicas)`.
   """
+  role_id = base_worker_id(hp, role, local_worker_id)
+  spec = _REPLICA_ROLE_SPECS.get(role)
+  if spec is None:
+    return role_id
   cluster = hp.config_mapping("cluster_config")
   target = cluster["target"]
-  role_id = (
-      str(cluster["k8s"][f"{role}_id"]) if target == "k8s" else local_worker_id
-  )
-  if role != "rollout":
+  replicas_key, env_var = spec
+  replicas = cluster[replicas_key]
+  replica = resolve_replica_index(role, replicas, env_var)
+  if replica is None or replicas == 1:
     return role_id
-  replicas = int(cluster["rollout_replicas"])
-  if replicas == 1 and ROLLOUT_REPLICA_ENV not in os.environ:
-    return role_id
-  if ROLLOUT_REPLICA_ENV not in os.environ:
-    raise ValueError(
-        f"{ROLLOUT_REPLICA_ENV} must be set on each rollout replica when"
-        f" cluster_config.rollout_replicas={replicas} (k8s.sh or the external"
-        " launcher sets it)."
-    )
-  raw_replica = os.environ[ROLLOUT_REPLICA_ENV]
-  if not raw_replica.isdecimal():
-    raise ValueError(
-        f"{ROLLOUT_REPLICA_ENV} must be a non-negative integer, got"
-        f" {raw_replica!r}."
-    )
-  replica = int(raw_replica)
-  if not 0 <= replica < replicas:
-    raise ValueError(
-        f"{ROLLOUT_REPLICA_ENV}={replica} is out of range for"
-        f" cluster_config.rollout_replicas={replicas}."
-    )
-  if replicas == 1:
-    return role_id
-  # `rollout-<i>` matches `rollout.LOCAL_WORKER_ID = "rollout-0"`.
+  # `<role>-<i>` matches `LOCAL_WORKER_ID` (`trainer-0`, `rollout-0`).
   return f"{role_id}-{replica}" if target == "k8s" else f"{role}-{replica}"
 
 
@@ -575,6 +627,8 @@ async def serve_worker(
         "instance_id": worker_service.instance_id,
         CONFIG_SHA256_METADATA_KEY: config_sha256,
     }
+    if jax.process_count() > 1:
+      metadata["jax_process_index"] = int(jax.process_index())
     if extra_metadata:
       metadata.update(extra_metadata)
     assert process_context.ipc is not None

@@ -274,6 +274,8 @@ class WorkerRegistry:
     resources: dict[str, Any] = {"remote": True, "address": service_address}
     if "trajectory_store_config" in md:
       resources["trajectory_store_config"] = md["trajectory_store_config"]
+    if "jax_process_index" in md:
+      resources["jax_process_index"] = int(md["jax_process_index"])
     info = datatypes.WorkerInfo(
         worker_id=worker_id,
         instance_id=instance_id,

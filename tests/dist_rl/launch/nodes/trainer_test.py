@@ -364,7 +364,7 @@ class TrainerFactoryTest(absltest.TestCase):
   ):
     hp_tunix = _hp()
     trainer._create_trainer_factory(hp_tunix, "trainer-0")
-    mock_create_tunix.assert_called_once_with(hp_tunix)
+    mock_create_tunix.assert_called_once_with(hp_tunix, "trainer-0")
     mock_create_maxtext.assert_not_called()
 
     mock_create_tunix.reset_mock()
@@ -406,7 +406,7 @@ class TrainerFactoryTest(absltest.TestCase):
         self._tunix_factory_patches(),
         mock.patch.object(peft_trainer_v2, "PeftTrainer") as mock_peft_trainer,
     ):
-      factory, mesh = trainer._create_tunix_trainer_factory(hp)
+      factory, mesh = trainer._create_tunix_trainer_factory(hp, "trainer-0")
       self.assertIs(mesh, self.mock_create_mesh.return_value)
       self.mock_create_mesh.assert_called_once_with(
           hp, "actor_model_config", "Trainer", devices=None
@@ -467,7 +467,7 @@ class TrainerFactoryTest(absltest.TestCase):
             peft_trainer_v2, "TrainingConfig"
         ) as mock_training_config,
     ):
-      trainer._create_tunix_trainer_factory(hp)
+      trainer._create_tunix_trainer_factory(hp, "trainer-0")
     mock_training_config.assert_called_once()
     self.assertNotIn(
         "max_seq_tokens_per_device", mock_training_config.call_args.kwargs
@@ -490,7 +490,7 @@ class TrainerFactoryTest(absltest.TestCase):
         self._tunix_factory_patches(),
         mock.patch.object(peft_trainer_v2, "PeftTrainer") as mock_peft_trainer,
     ):
-      factory, _ = trainer._create_tunix_trainer_factory(hp)
+      factory, _ = trainer._create_tunix_trainer_factory(hp, "trainer-0")
       factory()
     training_config = mock_peft_trainer.call_args.args[2]
     self.assertIsNone(training_config.checkpoint_root_directory)

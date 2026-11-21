@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+from concurrent import futures
 import inspect
 import json
 from multiprocessing import connection
@@ -173,6 +174,20 @@ class ProcHandle:
   def close(self) -> None:
     """Closes the underlying connection."""
     self._conn.close()
+
+
+def call_concurrent(
+    handles: Sequence[ProcHandle],
+    method: str,
+    argument: Any = None,
+) -> list[Any]:
+  """Invokes `method` concurrently on every handle and returns all results.
+
+  Each `ProcHandle.submit` enforces its own call timeout.
+  """
+  with futures.ThreadPoolExecutor(max_workers=len(handles)) as pool:
+    futs = [pool.submit(h.submit, method, argument) for h in handles]
+    return [f.result() for f in futs]
 
 
 class WorkerCluster:

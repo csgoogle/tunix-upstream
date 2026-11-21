@@ -367,6 +367,35 @@ weight_sync_config:
     self.assertIn("export ROLLOUT_REPLICAS=2\n", exports)
     self.assertNotIn("K8S_ROLLOUT_REPLICAS", exports)
 
+  def test_trainer_replicas(self):
+    k8s = ("cluster_config.target=k8s", "cluster_config.k8s.tunix_image=img")
+    ici = ("weight_sync_config.mode=ici", "rollout_engine=inprocess_vllm")
+
+    def replicas(*overrides: str) -> object:
+      cluster = resolve_config.initialize(list(overrides)).config_mapping(
+          "cluster_config"
+      )
+      return cluster["trainer_replicas"]
+
+    self.assertEqual(replicas(), 1)
+    self.assertEqual(
+        replicas(*k8s, *ici, "cluster_config.trainer_replicas=2"), 2
+    )
+    # `local.sh` starts one trainer.
+    with self.assertRaisesRegex(
+        ValueError, "cluster_config.trainer_replicas must be 1, got 2"
+    ):
+      replicas(*ici, "cluster_config.trainer_replicas=2")
+    # Only `ici_slice_worker` starts more than one trainer.
+    with self.assertRaisesRegex(
+        ValueError, "trainer_replicas=2 requires weight_sync_config.mode=ici"
+    ):
+      replicas(*k8s, "cluster_config.trainer_replicas=2")
+    with self.assertRaisesRegex(
+        ValueError, "cluster_config.trainer_replicas must be an int >= 1"
+    ):
+      replicas(*k8s, *ici, "cluster_config.trainer_replicas=0")
+
   def test_min_rollout_replicas(self):
     k8s = ("cluster_config.target=k8s", "agentic_grpo_config.beta=0.0")
     external = (

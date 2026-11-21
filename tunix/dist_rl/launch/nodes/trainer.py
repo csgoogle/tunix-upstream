@@ -47,6 +47,7 @@ from tunix.dist_rl.launch.common import resolve_config
 from tunix.dist_rl.launch.nodes import node_utils
 from tunix.dist_rl.train import abstract_trainer
 from tunix.dist_rl.train import peft_trainer_v2
+from tunix.dist_rl.weight_sync import ici_discovery
 from tunix.dist_rl.weight_sync import ici_maxtext_adapter
 from tunix.dist_rl.weight_sync import ici_weight_sync_delegate
 from tunix.dist_rl.worker import trainer_worker
@@ -332,6 +333,7 @@ def _load_actor_model(
 
 def _create_tunix_trainer_factory(
     hp: resolve_config.DistHyperParameters,
+    worker_id: str,
 ) -> tuple[TrainerFactory, Mesh]:
   """Creates the PeftTrainer v2 factory and the trainer mesh."""
   logging.info("Trainer backend: Tunix's PeftTrainer.")
@@ -355,7 +357,7 @@ def _create_tunix_trainer_factory(
       hp,
       _ACTOR_KEY,
       "Trainer",
-      devices=jax.local_devices() if is_ici else None,
+      devices=_ici_trainer_devices(hp) if is_ici else None,
   )
   logging.info("Trainer mesh: %s", mesh)
 
@@ -391,7 +393,7 @@ def _create_tunix_trainer_factory(
   rollout_tp_size = hp.mesh_axes("rollout_model_config")["tp"]
   worker_factory = (
       functools.partial(
-          ici_weight_sync_delegate.IciSourceSynchronizer, "trainer"
+          ici_weight_sync_delegate.IciSourceSynchronizer, worker_id
       )
       if is_ici
       else None
@@ -606,6 +608,21 @@ def _kwarg(kwargs: Mapping[str, KwargValue | None], key: str, unset: _T) -> _T:
   return unset if value is None else type(unset)(value)
 
 
+def _ici_trainer_devices(
+    hp: resolve_config.DistHyperParameters,
+) -> list[jax.Device]:
+  """Returns the trainer sub-world's devices inside a shared ICI JAX world."""
+  cluster = hp.config_mapping("cluster_config")
+  trainer_replicas = cluster["trainer_replicas"]
+  return ici_discovery.resolve_ici_trainer_devices(
+      trainer_replicas=trainer_replicas,
+      replica=node_utils.resolve_replica_index(
+          "trainer", trainer_replicas, node_utils.TRAINER_REPLICA_ENV
+      ),
+      timeout_s=cluster["init_timeout_s"],
+  )
+
+
 def _create_maxtext_trainer_factory(
     hp: resolve_config.DistHyperParameters, worker_id: str
 ) -> tuple[TrainerFactory, Mesh]:
@@ -613,7 +630,7 @@ def _create_maxtext_trainer_factory(
 
   Args:
     hp: Validated distributed RL configuration.
-    worker_id: Worker id, used as the MaxText run name.
+    worker_id: Worker id, used as the ICI weight sync job name.
 
   Returns:
     The trainer factory and the MaxText device mesh.
@@ -632,8 +649,8 @@ def _create_maxtext_trainer_factory(
       == common_datatypes.WeightSyncMode.ICI
   )
   # Under ICI the JAX world is shared with the rollouts, so the trainer owns
-  # only this process's devices.
-  trainer_devices = jax.local_devices() if is_ici else jax.devices()
+  # only the trainer processes' devices.
+  trainer_devices = _ici_trainer_devices(hp) if is_ici else jax.devices()
 
   adamw_options = _maxtext_adamw_options(hp)
   pad_id, _ = node_utils.pad_and_eos_ids(node_utils.load_hf_tokenizer(hp))
@@ -646,10 +663,15 @@ def _create_maxtext_trainer_factory(
         _ACTOR_OPTIMIZER_KEY,
         opt["schedule_type"],
     )
+  # All multi-host trainer replicas share one Orbax CheckpointManager directory
+  # (`{base_output_directory}/{run_name}/checkpoints`). Using the per-replica
+  # `worker_id` (`...-0`, `...-1`, ...) would split shards across separate
+  # directories and fail multi-host checkpoint save/restore.
+  maxtext_run_name = node_utils.base_worker_id(hp, "trainer", LOCAL_WORKER_ID)
   max_seq_tokens_per_device = rl_train["max_seq_tokens_per_device"]
   maxtext_config = maxtext_utils.build_maxtext_config(
       model_name=maxtext_model_name,
-      worker_id=worker_id,
+      worker_id=maxtext_run_name,
       train_micro_batch_size=int(rl_train["train_micro_batch_size"]),
       mesh_fsdp=axes["fsdp"],
       mesh_tp=axes["tp"],
@@ -713,7 +735,7 @@ def _create_maxtext_trainer_factory(
     )
     if is_ici:
       return ici_maxtext_adapter.IciMaxTextTrainerAdapter(
-          engine, job_name="trainer"
+          engine, job_name=worker_id
       )
     return engine
 
@@ -726,7 +748,7 @@ def _create_trainer_factory(
   """Dispatches on `actor_model_config.model_source` (maxtext vs tunix)."""
   if hp.config_mapping(_ACTOR_KEY)["model_source"] == "maxtext":
     return _create_maxtext_trainer_factory(hp, worker_id)
-  return _create_tunix_trainer_factory(hp)
+  return _create_tunix_trainer_factory(hp, worker_id)
 
 
 def main(

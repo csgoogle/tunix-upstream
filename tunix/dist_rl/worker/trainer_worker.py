@@ -38,6 +38,24 @@ if TYPE_CHECKING:
 WorkerState = datatypes.WorkerState
 
 
+@functools.lru_cache(maxsize=32)
+def _replicate_resharder(
+    sharding: jax.sharding.NamedSharding,
+) -> Callable[[jax.Array], jax.Array]:
+  """Caches the identity JIT used to gather multi-host logprobs onto host."""
+  return jax.jit(lambda x: x, out_shardings=sharding)
+
+
+def _gather_multihost_array(arr: jax.Array) -> jax.Array:
+  """Replicates a multi-host sharded array onto its devices for host reads."""
+  if arr.is_fully_addressable:
+    return arr
+  devices = sorted(arr.sharding.device_set, key=lambda d: d.id)
+  mesh = jax.sharding.Mesh(np.asarray(devices), ("_gather",))
+  replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+  return _replicate_resharder(replicated)(arr)
+
+
 def _compute_per_token_logps(
     model: nnx.Module,
     payload: datatypes.LogprobsScoringPayload,
@@ -499,7 +517,10 @@ class TrainerWorker(abstract_worker.Worker):
               routed_experts=None if routed is None else routed[sl],
           )
           outs.append(trainer.fwd_only(payload))
-        result = np.asarray(jnp.concatenate(outs, axis=0), dtype=np.float32)
+        concat = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=0)
+        if isinstance(concat, jax.Array):
+          concat = _gather_multihost_array(concat)
+        result = np.asarray(concat, dtype=np.float32)
       self._last_error = None
       return datatypes.LogprobsResponse(
           request_id=items.request_id,

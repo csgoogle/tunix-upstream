@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import dataclasses
 import gc
 import time
 from typing import Any
@@ -24,10 +25,13 @@ from typing import Any
 from absl import logging
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tunix.dist_rl.common import env_utils
 from tunix.dist_rl.weight_sync import ici_weight_sync_delegate
 from tunix.dist_rl.weight_sync import weight_sync
 from tunix.utils import maxtext_utils
+from tunix.utils import sharding_utils
+from tunix.utils import subworld_checkpoint
 
 
 def _extract_maxtext_params(engine: Any) -> Any:
@@ -131,6 +135,48 @@ class IciMaxTextTrainerAdapter:
     self._ici_sync: ici_weight_sync_delegate.IciSourceSynchronizer | None = None
     self._last_staged_step: int | None = None
     self._staged_metadata: list[weight_sync.WorkUnitMetadata] | None = None
+    self._active_processes = subworld_checkpoint.mesh_process_indices(
+        engine._mesh  # pylint: disable=protected-access
+    )
+    if jax.process_count() > 1 and not self._active_processes:
+      raise RuntimeError(
+          f"{type(engine).__name__}._mesh yielded no JAX process indices in a"
+          f" {jax.process_count()}-process world; cannot scope multi-host"
+          " batch sharding."
+      )
+    self._install_multihost_batch_sharding()
+
+  def _install_multihost_batch_sharding(self) -> None:
+    """Places multi-host MaxText global host batches via callback.
+
+    When the orchestrator fans a global micro-batch out to S > 1 McJAX trainer
+    processes, `MaxTextTrainingEngine._place_batch_inputs` uses `jax.device_put`
+    (which rejects multi-host shardings) and compiled `fwd_bwd` passes raw NumPy
+    arrays directly. Wrapping `_prepare_batch` converts global host array leaves
+    into globally-sharded `jax.Array`s right after `gen_model_input_fn` runs.
+    """
+    if len(self._active_processes) <= 1:
+      return
+    # pylint: disable=protected-access
+    orig_prepare = self._engine._prepare_batch
+    leaf_sharding = self._engine._leaf_data_sharding
+    input_spec = self._engine._input_data_spec
+
+    def _prepare_batch_multihost(payload: Any) -> Any:
+      batch = orig_prepare(payload)
+      data_spec = input_spec()
+
+      def _place(leaf: Any) -> Any:
+        if not isinstance(leaf, (jax.Array, np.ndarray)):
+          return leaf
+        return sharding_utils.place_array_on_target(
+            leaf, leaf_sharding(leaf, data_spec)
+        )
+
+      return jax.tree.map(_place, batch)
+
+    self._engine._prepare_batch = _prepare_batch_multihost
+    # pylint: enable=protected-access
 
   def __getattr__(self, name: str) -> Any:
     return getattr(self._engine, name)
@@ -206,6 +252,17 @@ class IciMaxTextTrainerAdapter:
           " cannot compute trainer-side per-token log-probs. Use a MaxText"
           " image with with_fwd_only_fn (>= aee266d4), or a config that does"
           " not need them."
+      )
+    if len(self._active_processes) > 1:
+      if (
+          dataclasses.is_dataclass(payload)
+          and "metadata" in payload.__dataclass_fields__
+      ):
+        payload = dataclasses.replace(payload, metadata={})
+      # pylint: disable-next=protected-access
+      shardings = self._engine._fwd_only_data_shardings(payload)
+      payload = jax.tree.map(
+          sharding_utils.place_array_leaf, payload, shardings
       )
     return self._engine.fwd_only(payload)
 

@@ -78,8 +78,13 @@ def resolve_self_hostname() -> str:
 class K8sJaxContext(context.JaxContext):
   """JAX distributed runtime initializer for Kubernetes pods."""
 
+  def __init__(self) -> None:
+    self._initialized = False
+
   def initialize(self) -> None:
-    """Initializes Pathways or standard JAX distributed runtime based on environment."""
+    """Initializes Pathways or standard JAX distributed runtime idempotently."""
+    if self._initialized:
+      return
     if "proxy" in os.environ.get("JAX_PLATFORMS", "") and os.environ.get(
         "JAX_BACKEND_TARGET"
     ):
@@ -88,14 +93,16 @@ class K8sJaxContext(context.JaxContext):
       import pathwaysutils
 
       pathwaysutils.initialize()
+      self._initialized = True
     elif "ray" in os.environ.get("TPU_MULTIHOST_BACKEND", ""):
-      pass
+      self._initialized = True
     else:
-      logging.info("initializing multi-controller JAX runtime")
-
       import jax
 
-      jax.distributed.initialize()
+      if not jax.distributed.is_initialized():
+        logging.info("initializing multi-controller JAX runtime")
+        jax.distributed.initialize()
+      self._initialized = True
 
 
 class K8sDiscoveryContext(context.DiscoveryContext):

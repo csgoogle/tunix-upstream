@@ -23,6 +23,7 @@ from unittest import mock
 from absl.testing import absltest
 import jax
 import jax.numpy as jnp
+import numpy as np
 from tunix.dist_rl.launch.common import resolve_config
 from tunix.dist_rl.launch.nodes import node_utils
 from tunix.dist_rl.launch.nodes import trainer as trainer_node
@@ -77,6 +78,7 @@ class _FakeMaxTextEngineBase:
     self.model = "fake-model"
     self._throttler = _FakeThrottler()
     self._target_state = {"sentinel": True}
+    self._mesh = None
     self._use_weight_converter = use_weight_converter
     self._weight_converter = _FakeConverter() if use_weight_converter else None
     self._config = types.SimpleNamespace(
@@ -291,6 +293,42 @@ class IciMaxTextTrainerAdapterTest(absltest.TestCase):
     report = adapter.ici_check({"plan": None})
     self.assertEqual(report["process"], jax.process_index())
 
+  def test_empty_active_processes_in_multiprocess_world_fails_fast(self):
+    engine = _FakeMaxTextEngine()
+    with mock.patch.object(jax, "process_count", return_value=2):
+      with self.assertRaisesRegex(RuntimeError, "yielded no JAX process"):
+        ici_maxtext_adapter.IciMaxTextTrainerAdapter(
+            engine, job_name="trainer"
+        )
+
+  def test_multihost_prepare_batch_places_array_leaves(self):
+    engine: Any = _FakeMaxTextEngine()
+    engine._mesh = types.SimpleNamespace(
+        devices=np.array([
+            types.SimpleNamespace(process_index=0),
+            types.SimpleNamespace(process_index=1),
+        ])
+    )
+    placed: list[tuple[tuple[int, ...], Any]] = []
+
+    def _leaf_data_sharding(leaf: Any, spec: Any) -> jax.sharding.Sharding:
+      placed.append((leaf.shape, spec))
+      return jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    engine._prepare_batch = lambda payload: payload
+    engine._input_data_spec = lambda: "data-spec"
+    engine._leaf_data_sharding = _leaf_data_sharding
+    with mock.patch.object(jax, "process_count", return_value=2):
+      ici_maxtext_adapter.IciMaxTextTrainerAdapter(
+          engine, job_name="trainer"
+      )
+
+    batch = engine._prepare_batch(
+        {"x": np.zeros((2, 2), dtype=np.float32), "n": 3}
+    )
+
+    self.assertEqual(batch["n"], 3)
+    self.assertEqual(placed, [((2, 2), "data-spec")])
 
 class MaxTextIciConfigAndWiringTest(absltest.TestCase):
 
@@ -320,6 +358,11 @@ class MaxTextIciConfigAndWiringTest(absltest.TestCase):
         types.SimpleNamespace(id=0, process_index=0),
         types.SimpleNamespace(id=1, process_index=0),
     ]
+    dev_p1 = [
+        types.SimpleNamespace(id=2, process_index=1),
+        types.SimpleNamespace(id=3, process_index=1),
+    ]
+    all_devs = dev_p0 + dev_p1
 
     hp = self._maxtext_ici_hp(
         "actor_model_config.mesh.shape=(2,1)",
@@ -340,7 +383,11 @@ class MaxTextIciConfigAndWiringTest(absltest.TestCase):
             autospec=True,
         )
     )
-    with mock.patch.object(jax, "local_devices", return_value=dev_p0):
+    with (
+        mock.patch.object(jax, "process_count", return_value=2),
+        mock.patch.object(jax, "process_index", return_value=0),
+        mock.patch.object(jax, "devices", return_value=all_devs),
+    ):
       factory, _ = trainer_node._create_maxtext_trainer_factory(hp, "trainer-0")
 
     self.assertEqual(mock_build_cfg.call_args.kwargs["num_devices"], 2)

@@ -1133,6 +1133,22 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
     payload = self._prepare_inputs(payload)
     if dataclasses.is_dataclass(payload) and hasattr(payload, "metadata"):
       payload = dataclasses.replace(payload, metadata={})
+    mesh = pxla.thread_resources.env.physical_mesh
+    if not mesh.empty and len(
+        subworld_checkpoint.mesh_process_indices(mesh)
+    ) > 1:
+      # Under multi-host McJAX, the orchestrator broadcasts the full global
+      # micro-batch to every trainer host; slice each host's addressable piece
+      # via `place_array_leaf` (`make_array_from_callback`) instead of
+      # `make_array_from_process_local_data`, which would multiply the global
+      # batch size by the trainer process count.
+      pspec = shd.PartitionSpec(*self.config.data_sharding_axis)
+      return jax.tree.map(
+          lambda x: sharding_utils.place_array_leaf(
+              x, sharding_utils.get_sharding(x, mesh=mesh, pspec=pspec)
+          ),
+          payload,
+      )
     return sharding_utils.shard_input(payload, self.config.data_sharding_axis)
 
   def _record_fwd_bwd(self, train_loss: jax.Array, aux: Any) -> None:

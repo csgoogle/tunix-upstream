@@ -365,6 +365,28 @@ class WorkerIdAndPortTest(absltest.TestCase):
       with self.assertRaisesRegex(ValueError, "must be set"):
         node_utils.worker_id(hp, "rollout", "r-0")
 
+  def test_k8s_trainer_replica_appends_index_and_base_id_omits_it(self):
+    hp = resolve_config.initialize([
+        "cluster_config.target=k8s",
+        "cluster_config.k8s.tunix_image=img:latest",
+        "cluster_config.k8s.trainer_id=my-train",
+        "cluster_config.trainer_replicas=2",
+        "weight_sync_config.mode=ici",
+        "rollout_engine=inprocess_vllm",
+    ])
+    replica_env = node_utils.TRAINER_REPLICA_ENV
+    with mock.patch.dict(os.environ, {replica_env: "1"}):
+      self.assertEqual(
+          node_utils.worker_id(hp, "trainer", "trainer-0"), "my-train-1"
+      )
+    self.assertEqual(
+        node_utils.base_worker_id(hp, "trainer", "trainer-0"), "my-train"
+    )
+    env = {k: v for k, v in os.environ.items() if k != replica_env}
+    with mock.patch.dict(os.environ, env, clear=True):
+      with self.assertRaisesRegex(ValueError, f"{replica_env} must be set"):
+        node_utils.worker_id(hp, "trainer", "trainer-0")
+
   def test_external_target_uses_fixed_local_worker_ids(self):
     hp = resolve_config.initialize(list(_EXTERNAL))
     replica_env = node_utils.ROLLOUT_REPLICA_ENV
