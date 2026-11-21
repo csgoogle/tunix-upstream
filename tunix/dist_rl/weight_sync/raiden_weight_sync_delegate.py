@@ -133,23 +133,6 @@ def canonicalize_variable_names(entry: Mapping[str, Any]) -> Mapping[str, Any]:
   return out
 
 
-def _free_kv_cache_during_weight_sync(sampler: Any) -> bool:
-  """Whether `sampler` wants its KV cache freed around the weight sync.
-
-  Mirrors `VllmConfig.free_kv_cache_during_weight_sync`; samplers without
-  that setting keep the historical free/re-allocate behaviour.
-  """
-  config = getattr(sampler, "config", None)
-  return bool(getattr(config, "free_kv_cache_during_weight_sync", True))
-
-
-def _partial_rollout_enabled(sampler: Any, default: bool = False) -> bool:
-  """Whether `sampler` has partial-rollout (in-flight weight updates) enabled."""
-  config = getattr(sampler, "config", None)
-  flag = getattr(config, "partial_rollout", False)
-  return bool(default or (isinstance(flag, bool) and flag))
-
-
 class RaidenWeightSyncDelegate:
   """Manages weight synchronization over Raiden for rollout samplers.
 
@@ -216,17 +199,13 @@ class RaidenWeightSyncDelegate:
     del kwargs
     return [s.work_unit_metadata() for s in self._synchronizers]
 
-  def _has_round(self, sync_request: Any) -> bool:
-    extra = getattr(sync_request, "extra_config", None) or {}
-    return extra.get("req_id") is not None
-
   async def pre_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Pre-sync phase hook executed before weight transfer begins."""
-    use_partial = _partial_rollout_enabled(
+    use_partial = weight_sync_coordinator.partial_rollout_enabled(
         self._sampler,
         default=bool(kwargs.get("partial_rollout", self.partial_rollout)),
     )
-    if self._has_round(sync_request):
+    if weight_sync_coordinator.has_round(sync_request):
       if not self._tracker.admit(sync_request, "prepared"):
         return True
       self._tracker.complete(sync_request, "prepared")
@@ -236,7 +215,9 @@ class RaidenWeightSyncDelegate:
 
     if use_partial:
       pass
-    elif _free_kv_cache_during_weight_sync(self._sampler):
+    elif weight_sync_coordinator.free_kv_cache_during_weight_sync(
+        self._sampler
+    ):
       self._sampler.delete_cache()
     else:
       # The KV pool stays allocated; only its stale prefix entries go.
@@ -248,7 +229,7 @@ class RaidenWeightSyncDelegate:
   async def weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Executes weight installation on device from host staging buffer."""
     del kwargs
-    if self._has_round(sync_request):
+    if weight_sync_coordinator.has_round(sync_request):
       if not self._tracker.admit(sync_request, "h2d_done"):
         return self._version
 
@@ -265,18 +246,18 @@ class RaidenWeightSyncDelegate:
         int(version) if version is not None else self._version + 1
     )
 
-    if self._has_round(sync_request):
+    if weight_sync_coordinator.has_round(sync_request):
       self._tracker.complete(sync_request, "h2d_done")
 
     return self._version
 
   async def post_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Post-sync phase hook executed after weight installation completes."""
-    use_partial = _partial_rollout_enabled(
+    use_partial = weight_sync_coordinator.partial_rollout_enabled(
         self._sampler,
         default=bool(kwargs.get("partial_rollout", self.partial_rollout)),
     )
-    if self._has_round(sync_request):
+    if weight_sync_coordinator.has_round(sync_request):
       if not self._tracker.admit(sync_request, "committed"):
         return True
 
@@ -288,14 +269,14 @@ class RaidenWeightSyncDelegate:
       raise RuntimeError("Sampler is not available for weight sync")
 
     if (
-        _free_kv_cache_during_weight_sync(self._sampler)
+        weight_sync_coordinator.free_kv_cache_during_weight_sync(self._sampler)
         and not use_partial
     ):
       self._sampler.reinitialize_cache()
     else:
       self._sampler.refresh_state_leaves()
 
-    if self._has_round(sync_request):
+    if weight_sync_coordinator.has_round(sync_request):
       self._tracker.complete(sync_request, "committed")
 
     return True
@@ -303,7 +284,7 @@ class RaidenWeightSyncDelegate:
   async def abort_weight_sync(self, sync_request: Any = None, **kwargs) -> Any:
     """Safely handles abort of weight sync round."""
     del kwargs
-    if self._has_round(sync_request):
+    if weight_sync_coordinator.has_round(sync_request):
       if not self._tracker.admit(sync_request, "aborted"):
         return False
       self._tracker.complete(sync_request, "aborted")

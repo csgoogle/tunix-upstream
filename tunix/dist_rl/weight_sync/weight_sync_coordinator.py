@@ -318,6 +318,29 @@ def _manifest_mismatches(
   return problems
 
 
+def has_round(sync_request: Any) -> bool:
+  """Whether `sync_request` belongs to a coordinator-tracked round."""
+  extra = getattr(sync_request, "extra_config", None) or {}
+  return extra.get("req_id") is not None
+
+
+def free_kv_cache_during_weight_sync(sampler: Any) -> bool:
+  """Whether `sampler` wants its KV cache freed around the weight sync.
+
+  Mirrors `VllmConfig.free_kv_cache_during_weight_sync`; samplers without
+  that setting keep the historical free/re-allocate behaviour.
+  """
+  config = getattr(sampler, "config", None)
+  return bool(getattr(config, "free_kv_cache_during_weight_sync", True))
+
+
+def partial_rollout_enabled(sampler: Any, default: bool = False) -> bool:
+  """Whether `sampler` has partial-rollout (in-flight updates) enabled."""
+  config = getattr(sampler, "config", None)
+  flag = getattr(config, "partial_rollout", False)
+  return bool(default or (isinstance(flag, bool) and flag))
+
+
 class StaleRoundError(RuntimeError):
   """A phase call carried a round key the worker cannot honor.
 

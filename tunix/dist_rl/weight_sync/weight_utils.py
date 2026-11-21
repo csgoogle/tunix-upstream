@@ -47,7 +47,11 @@ _CHECKSUM_META_KEYS = frozenset(
 
 
 class SyncedSamplerTarget(Protocol):
-  """Sampler surface required for out-of-place destination weight updates."""
+  """Sampler surface required for out-of-place destination weight updates.
+
+  `model_runner` is optional: `apply_to_sampler` updates a sampler that has
+  none (e.g. `VanillaSampler`) through `transformer_state` instead.
+  """
 
   @property
   def model_runner(self) -> Any:
@@ -525,7 +529,7 @@ def apply_to_sampler(
     delete_replaced_buffers: bool = False,
 ) -> None:
   """Installs `arrays` into `sampler.model_runner` or `sampler.transformer_state`."""
-  runner = sampler.model_runner
+  runner = getattr(sampler, "model_runner", None)
   if runner is not None:
     apply_to_runner(
         job_name,
