@@ -137,6 +137,10 @@ class InprocessVllmSampler(RaidenDestinationWeightSyncMixin, Sampler):
           self.server_id,
       )
     self.raiden_sync_delegate = raiden_sync_delegate
+    self._init_ici_delegate(
+        weight_sync_mode=self.weight_sync_mode,
+        partial_rollout=self.config.partial_rollout,
+    )
 
   def initialize(self) -> None:
     """Builds the vLLM engine from `config` on the first call."""

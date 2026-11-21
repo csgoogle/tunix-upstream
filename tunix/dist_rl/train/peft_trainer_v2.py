@@ -542,6 +542,7 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
     self._sampler_type = sampler_type
     self._rollout_tp_size = rollout_tp_size
     self._weight_sync_worker: Any = None
+    self._weight_sync_worker_factory = weight_sync_worker_factory
 
   def _sync_step_derived_state(self) -> None:
     """Recomputes everything derived from `_train_steps`"""
@@ -1425,11 +1426,14 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
 
   @override
   def prepare_weight_sync(self, *, sync_request: Any = None) -> Any:
-    """Stages this round's weights on the raiden transport, returns metadata."""
+    """Stages this round's weights on the sync transport, returns metadata."""
     del sync_request
     worker = self._weight_sync_worker
     if worker is None:
-      worker = _default_weight_sync_worker()
+      factory = (
+          self._weight_sync_worker_factory or _default_weight_sync_worker
+      )
+      worker = factory()
       self._weight_sync_worker = worker
 
     backend = "vllm_jax" if "vllm" in self._sampler_type else self._sampler_type
@@ -1485,11 +1489,36 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
   @override
   def release_weight_sync(self, *, sync_request: Any = None) -> Any:
     """Ends this round's staging hold."""
-    del sync_request
     worker = self._weight_sync_worker
     if worker is not None and worker.bound:
-      logging.vlog(1, "raiden metrics: %s", worker.metrics())
+      logging.vlog(1, "weight sync metrics: %s", worker.metrics())
+      # Lets a transport drop its references to this round's converted copy
+      # (a no-op for Raiden, whose staging is persistent).
+      worker.release(sync_request)
     return True
+
+  def ici_check(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Validates this trainer's part of an ICI transfer plan."""
+    if (
+        self._weight_sync_worker is None
+        and request["plan"] is None
+        and self._weight_sync_worker_factory is not None
+    ):
+      self._weight_sync_worker = self._weight_sync_worker_factory()
+    return self._require_ici_worker().check(request)
+
+  def ici_transfer(self, request: Mapping[str, Any]) -> Mapping[str, float]:
+    """Enters the ICI transfer collectives as the source."""
+    return self._require_ici_worker().transfer(request)
+
+  def _require_ici_worker(self) -> Any:
+    worker = self._weight_sync_worker
+    if worker is None:
+      raise RuntimeError(
+          "ICI weight sync needs prepare_weight_sync to have run with an ICI"
+          " source synchronizer (weight_sync_config.mode: ici)"
+      )
+    return worker
 
   @override
   def get_metrics(self) -> datatypes.MetricsBuffer:

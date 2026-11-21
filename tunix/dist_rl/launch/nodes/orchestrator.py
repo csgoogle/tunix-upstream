@@ -521,8 +521,9 @@ def create_cluster(
   cluster = hp.config_mapping("cluster_config")
   budget = cluster["poll_retry_budget_s"]
   ratio = cluster["min_active_rollout_ratio"]
+  mode = _weight_sync_mode(hp)
   return cluster_orchestrator.ClusterOrchestrator(
-      weight_sync_mode=_weight_sync_mode(hp).value,
+      weight_sync_mode=mode.value,
       trajectory_store_config=node_utils.trajectory_store_config(hp),
       weight_sync_timeouts=weight_sync_timeouts,
       fault_tolerance_config=datatypes.FaultToleranceConfig(
@@ -533,6 +534,11 @@ def create_cluster(
           min_active_rollout_grace_s=float(
               cluster["min_active_rollout_grace_s"]
           ),
+      ),
+      ici_chunk_bytes=(
+          resolve_config.ici_chunk_bytes(hp)
+          if mode == weight_sync.WeightSyncMode.ICI
+          else None
       ),
   )
 

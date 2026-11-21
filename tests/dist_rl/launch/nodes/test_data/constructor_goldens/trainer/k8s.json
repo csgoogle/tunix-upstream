@@ -192,7 +192,8 @@
         ],
         "kwargs": {
           "rollout_tp_size": 2,
-          "sampler_type": "inprocess_vllm"
+          "sampler_type": "inprocess_vllm",
+          "weight_sync_worker_factory": null
         }
       }
     }

@@ -207,7 +207,8 @@
         ],
         "kwargs": {
           "rollout_tp_size": 4,
-          "sampler_type": "vllm"
+          "sampler_type": "vllm",
+          "weight_sync_worker_factory": null
         }
       }
     }

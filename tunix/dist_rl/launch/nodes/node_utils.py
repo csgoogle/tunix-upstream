@@ -22,7 +22,7 @@ conversion without importing the heavy agentic `BasePipeline`.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 import contextlib
 import json
 import logging
@@ -37,6 +37,7 @@ import jax
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh
 import transformers
+from tunix.common import datatypes as common_datatypes
 from tunix.dist_rl.common import otel_setup
 from tunix.dist_rl.distributed.runtime import context as context_lib
 from tunix.dist_rl.launch.common import resolve_config
@@ -75,6 +76,7 @@ _LOGGED_ENV_VARS = frozenset({
     "DISABLE_JAX_CACHE",
     "DISABLE_MOSAIC_ATTN",
     "ENABLE_PATHWAYS_PERSISTENCE",
+    "ICI_DROP_OLD_WEIGHTS",
     "LOCAL_JAX_CACHE_DIR",
     "NEW_MODEL_DESIGN",
     "PJRT_DEVICE",
@@ -143,6 +145,11 @@ def _library_env(
   if role == "rollout":
     skip = hp.config_mapping("vllm_config")["skip_jax_precompile"]
     values["SKIP_JAX_PRECOMPILE"] = "1" if skip else "0"
+    values["ICI_DROP_OLD_WEIGHTS"] = (
+        ("true" if ws["ici_drop_old_weights"] else "false")
+        if ws["mode"] == common_datatypes.WeightSyncMode.ICI.value
+        else None
+    )
   return {
       name: (value, resolve_config.LIBRARY_ENV_CONFIG_KEYS[name])
       for name, value in values.items()
@@ -167,6 +174,9 @@ def apply_library_env(
     its NICs itself.
   * `SKIP_JAX_PRECOMPILE` (rollout): `vllm_config.skip_jax_precompile` as "1"
     or "0".
+  * `ICI_DROP_OLD_WEIGHTS` (rollout, `weight_sync_config.mode: ici` only):
+    `weight_sync_config.ici_drop_old_weights` as "true" or "false"; unset in
+    other modes.
 
   Args:
     hp: Validated distributed RL configuration.
@@ -627,22 +637,28 @@ async def serve_worker(
 # rejects meshes larger than the device count). Kept as in the removed
 # `run_*_node.py` mains for now.
 def create_mesh(
-    hp: resolve_config.DistHyperParameters, model_key: str, label: str
+    hp: resolve_config.DistHyperParameters,
+    model_key: str,
+    label: str,
+    *,
+    devices: Sequence[jax.Device] | None = None,
 ) -> Mesh:
-  """Builds the `(fsdp, tp)` device mesh for `model_key` over all devices.
+  """Builds the `(fsdp, tp)` device mesh for `model_key`.
 
   Args:
     hp: Validated distributed RL configuration.
     model_key: Model section whose `mesh` gives the fsdp/tp sizes, e.g.
       `actor_model_config`.
     label: Human-readable node name used in the error message.
+    devices: Devices to build the mesh over; defaults to `jax.devices()`. A
+      node sharing a multi-process JAX world (ICI weight sync) passes its own.
 
   Returns:
     The JAX mesh with axis names `MESH_AXIS_NAMES`.
 
   Raises:
     ValueError: If `dp` or `expert` is not 1, or if `fsdp * tp` does not equal
-      the visible device count.
+      the target device count.
   """
   axes = hp.mesh_axes(model_key)
   if axes["dp"] != 1 or axes["expert"] != 1:
@@ -651,17 +667,18 @@ def create_mesh(
         f" expert=1), got {model_key}.mesh axes={axes}."
     )
   shape = (axes["fsdp"], axes["tp"])
-  if shape[0] * shape[1] != jax.device_count():
+  target_devices = jax.devices() if devices is None else list(devices)
+  if shape[0] * shape[1] != len(target_devices):
     raise ValueError(
-        f"{label} mesh dimensions must multiply to visible JAX device count. "
-        f"Got {model_key}.mesh shape={shape}, devices={jax.device_count()}."
+        f"{label} mesh dimensions must multiply to the target device count. "
+        f"Got {model_key}.mesh shape={shape}, devices={len(target_devices)}."
     )
   # Shapes that already factor into whole physical axes get the same device
   # order; shapes like (8, 8) on a 4x4x4 slice need a split physical axis.
-  devices = mesh_utils.create_device_mesh(
-      shape, jax.devices(), allow_split_physical_axes=True
+  mesh_devices = mesh_utils.create_device_mesh(
+      shape, target_devices, allow_split_physical_axes=True
   )
-  return Mesh(devices, axis_names=MESH_AXIS_NAMES)
+  return Mesh(mesh_devices, axis_names=MESH_AXIS_NAMES)
 
 
 # TODO(noghabi): Drop `ensure_local_safetensors` and its helpers and let

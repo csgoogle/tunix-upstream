@@ -163,16 +163,63 @@ class NullHandler(weight_sync.WeightSyncHandler):
     return weight_sync.TransferResult(req_id=req_id or "", success=True)
 
 
+def _build_ici_handler(
+    registry: worker_registry.WorkerRegistry | None,
+    ici_chunk_bytes: int | None,
+) -> weight_sync.WeightSyncHandler:
+  """Constructs an `IciHandler` bound to all trainer and rollout workers."""
+  # Lazy imports match `raiden_handler` so rollout workers importing
+  # `WorkerRoundTracker` do not pull coordinator handlers at import time.
+  # pylint: disable=g-import-not-at-top
+  from tunix.dist_rl.weight_sync import ici_handler
+  from tunix.dist_rl.weight_sync import ici_transport
+  # pylint: enable=g-import-not-at-top
+
+  if registry is None:
+    raise ValueError(
+        "weight sync mode 'ici' needs the worker registry: its handler runs"
+        " the transfer on the trainer and rollout workers"
+    )
+
+  def _world_workers() -> list[remote_execution.ActorHandle]:
+    # Every trainer and rollout worker, whatever its admission status: a
+    # collective needs every process of the JAX world, serving or not.
+    handles: dict[str, remote_execution.ActorHandle] = {}
+    for role in (datatypes.Role.ACTOR, datatypes.Role.ROLLOUT):
+      for info, handle in registry.targets(role, statuses=None):
+        handles[info.worker_id] = handle
+    return list(handles.values())
+
+  chunk_bytes = (
+      ici_transport.DEFAULT_CHUNK_BYTES
+      if ici_chunk_bytes is None
+      else int(ici_chunk_bytes)
+  )
+  logging.info("Built IciHandler (chunk_bytes=%d).", chunk_bytes)
+  return ici_handler.IciHandler(_world_workers, chunk_bytes=chunk_bytes)
+
+
 def create_default_handler(
     mode: str | weight_sync.WeightSyncMode | None = None,
+    registry: worker_registry.WorkerRegistry | None = None,
+    ici_chunk_bytes: int | None = None,
 ) -> weight_sync.WeightSyncHandler:
   """Creates the default coordinator weight sync handler.
 
-  Supports `WeightSyncMode.RAIDEN` for production TPU RMA weight sync and
-  `WeightSyncMode.NOOP` / `WeightSyncMode.NONE` for protocol-only no-op
-  transfers (`NullHandler`).
+  Supports `WeightSyncMode.RAIDEN` for production TPU RMA weight sync,
+  `WeightSyncMode.ICI` for device-to-device sync between workers sharing one
+  JAX world, and `WeightSyncMode.NOOP` / `WeightSyncMode.NONE` for
+  protocol-only no-op transfers (`NullHandler`).
   Raises `NotImplementedError` for valid modes without a coordinator transport
   handler yet, and `ValueError` for unknown mode strings.
+
+  Args:
+    mode: Weight sync mode; defaults to the `WEIGHT_SYNC_MODE` environment
+      variable, then "raiden".
+    registry: The orchestrator's worker registry. Required by `ICI`, whose
+      handler fans the transfer out to the workers itself.
+    ici_chunk_bytes: Optional upper bound on global bytes per ICI collective;
+      defaults to `ici_transport.DEFAULT_CHUNK_BYTES` when None.
   """
   raw_mode = mode or os.getenv("WEIGHT_SYNC_MODE", "raiden")
   try:
@@ -191,6 +238,8 @@ def create_default_handler(
     )
     logging.info("Built RaidenHandler natively; port %d", handler.port)
     return handler
+  if resolved_mode == weight_sync.WeightSyncMode.ICI:
+    return _build_ici_handler(registry, ici_chunk_bytes)
   if resolved_mode in (
       weight_sync.WeightSyncMode.NONE,
       weight_sync.WeightSyncMode.NOOP,

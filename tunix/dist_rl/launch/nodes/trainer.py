@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 import dataclasses
+import functools
 import logging
 import os
 import re
@@ -40,11 +41,13 @@ import optax
 from orbax import checkpoint as ocp
 from tunix.cli import config as cli_config
 from tunix.cli.utils import model as model_utils
+from tunix.common import datatypes as common_datatypes
 from tunix.dist_rl.distributed.runtime import context as context_lib
 from tunix.dist_rl.launch.common import resolve_config
 from tunix.dist_rl.launch.nodes import node_utils
 from tunix.dist_rl.train import abstract_trainer
 from tunix.dist_rl.train import peft_trainer_v2
+from tunix.dist_rl.weight_sync import ici_weight_sync_delegate
 from tunix.dist_rl.worker import trainer_worker
 from tunix.models import automodel
 from tunix.utils import maxtext_utils
@@ -342,8 +345,17 @@ def _create_tunix_trainer_factory(
   )
   logging.info("Prepared trainer safetensors directory: %s", model_dir)
 
+  is_ici = (
+      hp.cluster_targets.weight_sync_mode
+      == common_datatypes.WeightSyncMode.ICI
+  )
   logging.info("Creating trainer mesh...")
-  mesh = node_utils.create_mesh(hp, _ACTOR_KEY, "Trainer")
+  mesh = node_utils.create_mesh(
+      hp,
+      _ACTOR_KEY,
+      "Trainer",
+      devices=jax.local_devices() if is_ici else None,
+  )
   logging.info("Trainer mesh: %s", mesh)
 
   training_config = _tunix_training_config(
@@ -376,6 +388,13 @@ def _create_tunix_trainer_factory(
   # rather than on TrainingConfig.
   sampler_type = str(hp.config["rollout_engine"])
   rollout_tp_size = hp.mesh_axes("rollout_model_config")["tp"]
+  worker_factory = (
+      functools.partial(
+          ici_weight_sync_delegate.IciSourceSynchronizer, "trainer"
+      )
+      if is_ici
+      else None
+  )
 
   def _factory() -> abstract_trainer.AbstractTrainer:
     logging.info("Loading actor model...")
@@ -386,6 +405,7 @@ def _create_tunix_trainer_factory(
         training_config,
         sampler_type=sampler_type,
         rollout_tp_size=rollout_tp_size,
+        weight_sync_worker_factory=worker_factory,
     )
 
   return _factory, mesh

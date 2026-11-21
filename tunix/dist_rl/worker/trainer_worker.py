@@ -555,6 +555,27 @@ class TrainerWorker(abstract_worker.Worker):
       self.state = WorkerState.ERROR
       raise
 
+  def _require_ici_trainer(self) -> abstract_trainer.IciWeightSyncCapable:
+    # Not `_ensure_ready()`: ICI calls run between `prepare_weight_sync` and
+    # `release_weight_sync`, while the state is SYNCING.
+    if self._trainer is None:
+      raise RuntimeError("TrainerWorker is not initialized.")
+    if not isinstance(self._trainer, abstract_trainer.IciWeightSyncCapable):
+      raise NotImplementedError(
+          f"{type(self._trainer).__name__} does not support ICI weight sync."
+      )
+    return self._trainer
+
+  @abstract_worker.offload_to_thread
+  def ici_check(self, request: Any) -> Any:
+    """Validates this trainer's part of an ICI transfer plan."""
+    return self._require_ici_trainer().ici_check(request)
+
+  @abstract_worker.offload_to_thread
+  def ici_transfer(self, request: Any) -> Any:
+    """Enters the ICI transfer collectives as the source."""
+    return self._require_ici_trainer().ici_transfer(request)
+
   @abstract_worker.offload_to_thread
   def release_weight_sync(self, sync_request: Any = None) -> Any:
     """Releases this round's staging and restores READY."""

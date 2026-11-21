@@ -114,6 +114,7 @@
       "tunix.dist_rl.orchestrator.orchestrator.ClusterOrchestrator": {
         "kwargs": {
           "fault_tolerance_config": "<tunix.dist_rl.common.datatypes.FaultToleranceConfig()>",
+          "ici_chunk_bytes": null,
           "trajectory_store_config": {
             "backend": "file",
             "root_dir": "/artifacts/trajectory_store",

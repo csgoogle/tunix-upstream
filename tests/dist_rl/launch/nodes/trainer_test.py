@@ -409,7 +409,7 @@ class TrainerFactoryTest(absltest.TestCase):
       factory, mesh = trainer._create_tunix_trainer_factory(hp)
       self.assertIs(mesh, self.mock_create_mesh.return_value)
       self.mock_create_mesh.assert_called_once_with(
-          hp, "actor_model_config", "Trainer"
+          hp, "actor_model_config", "Trainer", devices=None
       )
       self.mock_load_model.assert_not_called()
 

@@ -832,6 +832,7 @@ class ClusterTest(absltest.TestCase):
         trajectory_store_config=None,
         weight_sync_timeouts=phase_timeouts,
         fault_tolerance_config=datatypes.FaultToleranceConfig(enabled=True),
+        ici_chunk_bytes=None,
     )
     self.assertTrue(cluster.fault_tolerance_manager.config.enabled)
     # Workers register later, in `run_program`.
