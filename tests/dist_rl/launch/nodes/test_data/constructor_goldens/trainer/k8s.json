@@ -49,6 +49,7 @@
     {
       "tunix.sft.checkpoint_options.TunixCheckpointingOptions": {
         "kwargs": {
+          "active_processes": null,
           "async_options": {
             "__type__": "AsyncOptions"
           },
@@ -79,6 +80,7 @@
     {
       "tunix.sft.checkpoint_options.TunixCheckpointingOptions": {
         "kwargs": {
+          "active_processes": null,
           "async_options": {
             "__type__": "AsyncOptions"
           },

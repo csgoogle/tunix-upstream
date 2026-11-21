@@ -16,6 +16,7 @@
 
 import os
 import tempfile
+import types
 from unittest import mock
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -716,6 +717,32 @@ class CheckpointManagerTest(parameterized.TestCase):
     converted = checkpoint_manager._convert_host_local_array(arr)
     self.assertIsInstance(converted, jax.Array)
     np.testing.assert_allclose(converted, np.array([1.0, 2.0, 3.0]))
+
+  def test_convert_host_local_array_preserves_scalar_dtypes(self):
+    devices = jax.devices()
+    for dtype in (jnp.int32, jnp.bfloat16, jnp.float32):
+      arr = jax.device_put(jnp.asarray(7, dtype=dtype), devices[0])
+      out = checkpoint_manager._convert_host_local_array(
+          arr, mesh_devices=devices
+      )
+      self.assertEqual(out.dtype, dtype)
+      self.assertEqual(set(out.devices()), set(devices))
+
+  def test_mesh_devices_for_state_never_leaks_rollout_devices(self):
+    fake_d0 = types.SimpleNamespace(id=0, process_index=0)
+    fake_d1 = types.SimpleNamespace(id=1, process_index=1)
+    with (
+        mock.patch.object(jax, 'process_count', return_value=2),
+        mock.patch.object(jax, 'devices', return_value=[fake_d0, fake_d1]),
+    ):
+      resolved = checkpoint_manager._mesh_devices_for_state(
+          {}, active_processes=frozenset({1})
+      )
+      self.assertEqual(resolved, [fake_d1])
+      with self.assertRaisesRegex(RuntimeError, 'No JAX devices found'):
+        checkpoint_manager._mesh_devices_for_state(
+            {}, active_processes=frozenset({3})
+        )
 
   def test_unknown_partition_spec_axis_is_replicated_for_restore(self):
     pspec = shd.PartitionSpec('norm')

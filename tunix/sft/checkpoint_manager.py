@@ -14,7 +14,7 @@
 
 """Checkpoint manager for PEFT."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import functools
 import os
 import time
@@ -29,31 +29,66 @@ from orbax.checkpoint import utils as ocp_utils
 from orbax.checkpoint import v1 as ocp
 from tunix.sft import checkpoint_options
 from tunix.utils import sharding_utils
+from tunix.utils import subworld_checkpoint
 
 
-def _convert_host_local_array(x: Any) -> Any:
-  """Converts host-local arrays to global arrays in multi-device/multi-host settings."""
-  if (
-      isinstance(x, jax.Array)
-      and len(x.devices()) == 1
-      and len(jax.devices()) > 1
+def _mesh_devices_for_state(
+    state: Any,
+    active_processes: frozenset[int] | None = None,
+) -> list[jax.Device] | None:
+  """Returns the mesh devices owning `state`, or trainer-scoped fallback."""
+  for leaf in jax.tree_util.tree_leaves(state):
+    shd = getattr(leaf, 'sharding', None)
+    if isinstance(shd, jax.sharding.NamedSharding):
+      return list(shd.mesh.devices.flat)
+  if active_processes is not None and subworld_checkpoint.is_subworld(
+      active_processes
   ):
-    mesh = jax.sharding.Mesh(np.array(jax.devices()), axis_names=('x',))
-    replicated_sharding = jax.sharding.NamedSharding(
-        mesh, jax.sharding.PartitionSpec()
+    devices = sorted(
+        (d for d in jax.devices() if d.process_index in active_processes),
+        key=lambda d: (d.process_index, d.id),
     )
-    if not x.shape:
-      return sharding_utils.place_array_on_target(
-          np.asarray(x.item()), replicated_sharding
+    if not devices:
+      raise RuntimeError(
+          'No JAX devices found for sub-world active_processes='
+          f'{sorted(active_processes)}.'
       )
-    else:
-      try:
-        return ocp_utils.fully_replicated_host_local_array_to_global_array(x)
-      except ValueError:
-        return sharding_utils.place_array_on_target(
-            np.asarray(x), replicated_sharding
-        )
-  return x
+    return devices
+  return None
+
+
+def _convert_host_local_array(
+    x: Any,
+    *,
+    mesh_devices: Sequence[jax.Device] | None = None,
+) -> Any:
+  """Converts host-local arrays to global arrays in multi-device settings."""
+  target_devices = list(mesh_devices) if mesh_devices else list(jax.devices())
+  if not (
+      isinstance(x, jax.Array)
+      and x.is_fully_addressable
+      and len(target_devices) > 1
+      and set(x.devices()) != set(target_devices)
+  ):
+    return x
+  if x.shape and mesh_devices is None and jax.process_count() == 1:
+    try:
+      return ocp_utils.fully_replicated_host_local_array_to_global_array(x)
+    except ValueError:
+      logging.vlog(
+          1,
+          'Falling back to place_array_on_target for shape=%s dtype=%s.',
+          x.shape,
+          x.dtype,
+      )
+  mesh = jax.sharding.Mesh(np.array(target_devices), axis_names=('x',))
+  replicated_sharding = jax.sharding.NamedSharding(
+      mesh, jax.sharding.PartitionSpec()
+  )
+  # Preserve exact scalar/array dtypes (e.g. int32, bfloat16) via np.asarray(x).
+  return sharding_utils.place_array_on_target(
+      np.asarray(x), replicated_sharding
+  )
 
 
 def _replicate_if_pspec_uses_unknown_mesh_axis(
@@ -114,15 +149,24 @@ def _fix_sharding(state: Any) -> Any:
     return state
 
   target_shardings = _get_named_sharding(state, mesh)
-  return jax.tree_util.tree_map(
-      lambda x, shd: jax.ShapeDtypeStruct(
-          getattr(x, 'shape', ()),
-          getattr(x, 'dtype', jax.numpy.asarray(x).dtype),
-          sharding=shd,
-      ),
-      state,
-      target_shardings,
-  )
+
+  def _to_abstract(x: Any, shd: jax.sharding.NamedSharding) -> Any:
+    cur_shd = getattr(x, 'sharding', None)
+    if (
+        shd.spec == jax.sharding.PartitionSpec()
+        and isinstance(cur_shd, jax.sharding.NamedSharding)
+    ):
+      resolved = cur_shd
+    else:
+      resolved = shd
+    dtype = x.dtype if hasattr(x, 'dtype') else jax.numpy.asarray(x).dtype
+    return jax.ShapeDtypeStruct(
+        getattr(x, 'shape', ()),
+        dtype,
+        sharding=resolved,
+    )
+
+  return jax.tree_util.tree_map(_to_abstract, state, target_shardings)
 
 
 class CheckpointManager:
@@ -145,6 +189,9 @@ class CheckpointManager:
         options
     )
     if root_directory:
+      subworld_checkpoint.configure_subworld_checkpointing(
+          self._options.active_processes
+      )
       self._checkpointer = ocp.training.Checkpointer(
           root_directory,
           context=self._context,
@@ -195,7 +242,9 @@ class CheckpointManager:
     if is_proxy_pathways:
       ctx.array.saving.use_ocdbt = False
       ctx.array.saving.use_zarr3 = False
-    return ctx
+    return subworld_checkpoint.configure_v1_context(
+        ctx, self._options.active_processes
+    )
 
   def _save_checkpointables(
       self,
@@ -269,8 +318,18 @@ class CheckpointManager:
 
     if optimizer is not None:
       optimizer_state = nnx.state(optimizer, nnx.optimizer.OptState)
-      # Convert host-local arrays in state PyTree to global arrays.
-      optimizer_state = jax.tree.map(_convert_host_local_array, optimizer_state)
+      # Convert host-local arrays in state PyTree to global arrays on the
+      # model's own mesh devices (never pulling in non-trainer devices in a
+      # shared multi-process JAX world).
+      mesh_devices = _mesh_devices_for_state(
+          params, active_processes=self._options.active_processes
+      )
+      optimizer_state = jax.tree.map(
+          functools.partial(
+              _convert_host_local_array, mesh_devices=mesh_devices
+          ),
+          optimizer_state,
+      )
       checkpointables = {
           'model_params': params,
           'optimizer_state': optimizer_state,
