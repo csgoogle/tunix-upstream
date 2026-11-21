@@ -47,6 +47,7 @@ from tunix.dist_rl.launch.common import resolve_config
 from tunix.dist_rl.launch.nodes import node_utils
 from tunix.dist_rl.train import abstract_trainer
 from tunix.dist_rl.train import peft_trainer_v2
+from tunix.dist_rl.weight_sync import ici_maxtext_adapter
 from tunix.dist_rl.weight_sync import ici_weight_sync_delegate
 from tunix.dist_rl.worker import trainer_worker
 from tunix.models import automodel
@@ -626,6 +627,13 @@ def _create_maxtext_trainer_factory(
   rollout = hp.config_mapping("rollout_config")
   opt = rl_train[_ACTOR_OPTIMIZER_KEY]
   axes = hp.mesh_axes(_ACTOR_KEY)
+  is_ici = (
+      hp.cluster_targets.weight_sync_mode
+      == common_datatypes.WeightSyncMode.ICI
+  )
+  # Under ICI the JAX world is shared with the rollouts, so the trainer owns
+  # only this process's devices.
+  trainer_devices = jax.local_devices() if is_ici else jax.devices()
 
   adamw_options = _maxtext_adamw_options(hp)
   pad_id, _ = node_utils.pad_and_eos_ids(node_utils.load_hf_tokenizer(hp))
@@ -647,7 +655,7 @@ def _create_maxtext_trainer_factory(
       mesh_tp=axes["tp"],
       mesh_expert=axes["expert"],
       mesh_context=_kwarg(kwargs, "mesh_context", 1),
-      num_devices=jax.device_count(),
+      num_devices=len(trainer_devices),
       max_prompt_length=int(rollout["max_prompt_length"]),
       max_response_length=int(rollout["total_generation_steps"]),
       learning_rate=float(opt["learning_rate"]),
@@ -691,16 +699,23 @@ def _create_maxtext_trainer_factory(
       skip_step_scaling_factor=_kwarg(kwargs, "skip_step_scaling_factor", 6.0),
   )
   logging.info("Creating MaxText device mesh...")
-  mesh = maxtext_utils.create_maxtext_mesh(maxtext_config)
+  mesh = maxtext_utils.create_maxtext_mesh(
+      maxtext_config, devices=trainer_devices
+  )
   logging.info("Trainer mesh: %s", mesh)
 
   def _factory() -> abstract_trainer.AbstractTrainer:
-    return maxtext_utils.create_maxtext_engine(
+    engine = maxtext_utils.create_maxtext_engine(
         maxtext_config,
         mesh=mesh,
         tokenizer_pad_id=pad_id,
         wrap_with_tunix_adapter=True,
     )
+    if is_ici:
+      return ici_maxtext_adapter.IciMaxTextTrainerAdapter(
+          engine, job_name="trainer"
+      )
+    return engine
 
   return _factory, mesh
 

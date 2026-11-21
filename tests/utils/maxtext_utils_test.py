@@ -1256,6 +1256,29 @@ class MaxTextUtilsTest(absltest.TestCase):
         "no callable '_execute_group_target_free'", "\n".join(warn_logs.output)
     )
 
+  def test_create_maxtext_mesh_forwards_devices(self):
+    mock_mutils = mock.MagicMock()
+    cfg = mock.MagicMock(mesh_axes=("fsdp", "tp"))
+    devices = [mock.sentinel.dev0, mock.sentinel.dev1]
+
+    with (
+        mock.patch.object(
+            maxtext_utils,
+            "maxtext_modules",
+            return_value=(None, None, mock_mutils),
+            autospec=True,
+        ),
+        mock.patch.object(jax.sharding, "Mesh", autospec=True) as mock_mesh,
+    ):
+      maxtext_utils.create_maxtext_mesh(cfg, devices=devices)
+
+    mock_mutils.create_device_mesh.assert_called_once_with(
+        cfg, devices=devices
+    )
+    mock_mesh.assert_called_once_with(
+        mock_mutils.create_device_mesh.return_value, ("fsdp", "tp")
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

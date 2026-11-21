@@ -1082,13 +1082,6 @@ def _validate_ici_weight_sync(hp: cli_config.HyperParameters) -> None:
     )
   if ws["mode"] != common_datatypes.WeightSyncMode.ICI.value:
     return
-  if hp.config_mapping("actor_model_config")["model_source"] == "maxtext":
-    raise ValueError(
-        "weight_sync_config.mode=ici is not supported with a MaxText trainer"
-        " (actor_model_config.model_source='maxtext') yet: the MaxText"
-        " training engine has no ICI source. Use the Tunix trainer or"
-        " weight_sync_config.mode=raiden."
-    )
   rollout_engine = hp.config["rollout_engine"]
   if rollout_engine not in ("inprocess_vllm", "vanilla"):
     raise ValueError(
